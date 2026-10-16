@@ -1,0 +1,187 @@
+name: TEESimulator-RS v307 - StrongBox PR54 (NO INSTALL)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-audit:
+    name: Build and audit (no phone access)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      BASE_SHA: 6d241e56d6e8146cd67ed4ac3dadc9c632969549
+      PATCH_SHA: fc257bad1753f4258f23a42b85574d972c41b473
+      BASELINE_SHA256: ea4cfad7312834b4843e1fe2d7107e4d587e8c988eca558e0656985043928051
+      ORIGINAL_DEX_SHA256: a90f5e0a333e6e3cadf8231ffe114b858c4c594dc4f9041ea5e55e115f872364
+      ZIP_NAME: TEESimulator-RS-v6.0.1-307-Release.zip
+
+    steps:
+      - name: Prepare Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Prepare Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install exact SDK, NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'platforms;android-36' \
+            'build-tools;36.0.0' \
+            'ndk;27.3.13750724' \
+            'cmake;3.22.1' \
+            'platform-tools'
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
+          test -d "$ANDROID_HOME/ndk/27.3.13750724"
+          test -d "$ANDROID_HOME/platforms/android-36"
+          test -d "$ANDROID_HOME/build-tools/36.0.0"
+
+      - name: Prepare Rust Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --locked
+          cargo ndk --version
+
+      - name: Fetch and authenticate official v307 release
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 3 \
+            "https://github.com/Enginex0/TEESimulator-RS/releases/download/v6.0.1-307/$ZIP_NAME" \
+            --output "$ZIP_NAME"
+          echo "$BASELINE_SHA256  $ZIP_NAME" | sha256sum --check --status
+          python3 - <<'PY'
+          import os, zipfile
+          filename = os.environ['ZIP_NAME']
+          with zipfile.ZipFile(filename) as z:
+              assert z.testzip() is None, 'Original ZIP CRC failure'
+              props = z.read('module.prop').decode()
+              assert 'id=tricky_store\n' in props
+              assert 'version=v6.0.1-307\n' in props
+              assert 'versionCode=307\n' in props
+              for name in ('classes.dex', 'customize.sh', 'uninstall.sh', 'target.txt', 'keybox.xml', 'lib/arm64-v8a/libTEESimulator.so'):
+                  assert name in z.namelist(), name
+          print('PASS: signed-off official release ZIP identity and structure')
+          PY
+
+      - name: Fetch pinned sources and verify EXACT PR 54
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --branch v6.0.1-307 https://github.com/Enginex0/TEESimulator-RS.git tee-source
+          cd tee-source
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          git fetch origin pull/54/head:refs/remotes/origin/pr54-pinned
+          test "$(git rev-parse refs/remotes/origin/pr54-pinned)" = "$PATCH_SHA"
+          test "$(git rev-list --parents -n 1 "$PATCH_SHA")" = "$PATCH_SHA $BASE_SHA"
+          git diff --check "$BASE_SHA" "$PATCH_SHA"
+          python3 - <<'PY'
+          import os, subprocess
+          base, patch = os.environ['BASE_SHA'], os.environ['PATCH_SHA']
+          names = set(subprocess.check_output(['git', 'diff', '--name-only', base, patch], text=True).splitlines())
+          expected = {
+              'app/src/main/java/org/matrix/TEESimulator/interception/keystore/InterceptorUtils.kt',
+              'app/src/main/java/org/matrix/TEESimulator/interception/keystore/shim/KeyMintSecurityLevelInterceptor.kt',
+              'app/src/main/java/org/matrix/TEESimulator/interception/keystore/shim/OperationInterceptor.kt',
+              'app/src/main/java/org/matrix/TEESimulator/interception/keystore/shim/SoftwareOperation.kt',
+          }
+          assert names == expected, f'Unexpected changed files: {names ^ expected}'
+          print('PASS: exactly four approved Kotlin source paths')
+          PY
+          git merge --ff-only "$PATCH_SHA"
+          test "$(git rev-parse HEAD)" = "$PATCH_SHA"
+          grep -q 'reserveStrongBoxOp' app/src/main/java/org/matrix/TEESimulator/interception/keystore/shim/KeyMintSecurityLevelInterceptor.kt
+          grep -q 'onFinalizeCallback' app/src/main/java/org/matrix/TEESimulator/interception/keystore/shim/SoftwareOperation.kt
+          git diff "$BASE_SHA" "$PATCH_SHA" > ../StrongBox_PR54_source.diff
+          echo 'PASS: pinned v307 and exact PR #54 applied'
+
+      - name: Compile and package source using upstream Gradle tasks
+        shell: bash
+        working-directory: tee-source
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          java -version
+          cargo --version
+          ./gradlew zipRelease --no-daemon --stacktrace
+          test "$(find out -maxdepth 1 -type f -name '*Release.zip' | wc -l)" -eq 1
+
+      - name: Repack only patched DEX, preserving v307 native binaries and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import hashlib, os, pathlib, struct, zipfile, zlib
+          p = pathlib.Path
+          official = p(os.environ['ZIP_NAME'])
+          built = list(p('tee-source/out').glob('*Release.zip'))
+          assert len(built) == 1, f'Expected one Gradle ZIP, found: {built}'
+          original_sha = os.environ['ORIGINAL_DEX_SHA256']
+          with zipfile.ZipFile(built[0]) as b:
+              assert b.testzip() is None, 'Compiled ZIP has CRC errors'
+              dex_files = [n for n in b.namelist() if n.endswith('.dex')]
+              assert dex_files == ['classes.dex'], f'Unsupported multi-DEX build: {dex_files}'
+              dex = b.read('classes.dex')
+          assert dex[:4] == b'dex\n' and dex[7:8] == b'\x00' and len(dex) > 100_000, 'Invalid DEX header/length'
+          assert struct.unpack('<I', dex[32:36])[0] == len(dex), 'Invalid DEX file size'
+          assert struct.unpack('<I', dex[8:12])[0] == zlib.adler32(dex[12:]) & 0xffffffff, 'Invalid DEX Adler32'
+          assert dex[12:32] == hashlib.sha1(dex[32:]).digest(), 'Invalid DEX SHA1 signature'
+          assert hashlib.sha256(dex).hexdigest() != original_sha, 'DEX unchanged; refusing candidate'
+          output = p('dist/UNVERIFIED_TEESimulator-RS_v307_SB54_CI.zip')
+          with zipfile.ZipFile(official) as baseline:
+              assert hashlib.sha256(baseline.read('classes.dex')).hexdigest() == original_sha
+              props = baseline.read('module.prop').decode()
+              assert props.count('version=v6.0.1-307\n') == 1
+              props = props.replace('version=v6.0.1-307\n','version=v6.0.1-307-SB54-CI-UNVERIFIED\n')
+              # Avoid advertising an unofficial update endpoint; leave versionCode at 307.
+              props = '\n'.join(x for x in props.splitlines() if not x.startswith('updateJson=')) + '\n'
+              with zipfile.ZipFile(output, 'w') as candidate:
+                  for info in baseline.infolist():
+                      data = dex if info.filename == 'classes.dex' else (props.encode() if info.filename == 'module.prop' else baseline.read(info.filename))
+                      candidate.writestr(info, data)
+          with zipfile.ZipFile(official) as baseline, zipfile.ZipFile(output) as candidate:
+              assert candidate.testzip() is None
+              assert baseline.namelist() == candidate.namelist(), 'File inventory differs'
+              differences = {name for name in baseline.namelist() if baseline.read(name) != candidate.read(name)}
+              assert differences == {'classes.dex','module.prop'}, f'Other files changed: {differences}'
+              assert 'updateJson=' not in candidate.read('module.prop').decode()
+              for name in baseline.namelist():
+                  if name.startswith('lib/') and not name.endswith('/'):
+                      assert baseline.read(name) == candidate.read(name), name
+          digest = lambda filename: hashlib.sha256(p(filename).read_bytes()).hexdigest()
+          p('dist/SHA256SUMS.txt').write_text(f'{digest(official)}  {official.name}\n{digest(output)}  {output.name}\n')
+          p('dist/BUILD_STATUS.txt').write_text(
+              'STATUS: COMPILED AND STATICALLY CHECKED; DEVICE UNVERIFIED\n'
+              'Base: TEESimulator-RS v6.0.1-307 / 6d241e56d6e8146cd67ed4ac3dadc9c632969549\n'
+              'Patch: PR #54 / fc257bad1753f4258f23a42b85574d972c41b473\n'
+              'Changes in output ZIP: classes.dex, module.prop only.\n'
+              'This ZIP has NOT been tested for Wallet, Strong Integrity, app login, or biometric key accessibility.\n'
+              'DO NOT INSTALL until independently reviewed and a recovery plan exists.\n'
+              'Original uninstall.sh is retained and may delete persistent_keys if uninstalled.\n'
+          )
+          print('PASS: native libraries, original scripts and packaged config files unchanged')
+          print('OUTPUT:', output)
+          PY
+          cp StrongBox_PR54_source.diff dist/StrongBox_PR54_source.diff
+
+      - name: Upload build candidate and source diff (NOT certified for installation)
+        uses: actions/upload-artifact@v4
+        with:
+          name: TEESimulator-v307-StrongBox-PR54-UNVERIFIED
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
